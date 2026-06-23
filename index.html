@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>比赛打分系统</title>
+  <!-- 引入 Supabase SDK -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: #f5f5f5; padding: 20px; }
+    .tab-buttons { display: flex; gap: 10px; margin-bottom: 20px; }
+    .tab-buttons button { padding: 10px 20px; cursor: pointer; border: none; background: #ddd; border-radius: 5px; font-size: 16px; }
+    .tab-buttons button.active { background: #4CAF50; color: white; }
+    .tab-content { background: white; border-radius: 8px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    .hidden { display: none; }
+    label { display: block; margin: 10px 0 5px; font-weight: bold; }
+    select, input[type="number"] { width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 16px; }
+    input[type="number"] { max-width: 100px; }
+    .score-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); gap: 10px; }
+    .submit-btn { background: #4CAF50; color: white; border: none; padding: 12px 24px; font-size: 18px; border-radius: 5px; cursor: pointer; margin-top: 20px; width: 100%; }
+    .submit-btn:disabled { background: #aaa; cursor: not-allowed; }
+    .message { margin-top: 10px; padding: 10px; border-radius: 5px; }
+    .success { background: #d4edda; color: #155724; }
+    .error { background: #f8d7da; color: #721c24; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 14px; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: center; }
+    th { background: #f2f2f2; }
+    .refresh-btn { margin-top: 10px; }
+  </style>
+</head>
+<body>
+
+  <!-- 标签切换 -->
+  <div class="tab-buttons">
+    <button id="judgeTab" class="active" onclick="switchTab('judge')">评委打分</button>
+    <button id="adminTab" onclick="switchTab('admin')">排名查看</button>
+  </div>
+
+  <!-- 评委打分界面 -->
+  <div id="judgePanel" class="tab-content">
+    <h2>评委打分</h2>
+    <label for="judgeSelect">评委编号</label>
+    <select id="judgeSelect">
+      <option value="">-- 请选择 --</option>
+    </select>
+    <label for="contestantSelect">选手</label>
+    <select id="contestantSelect">
+      <option value="">-- 请选择 --</option>
+    </select>
+    <div class="score-grid" id="scoreGrid"></div>
+    <button class="submit-btn" id="submitBtn" disabled onclick="submitScore()">提交打分</button>
+    <div id="judgeMessage" class="message hidden"></div>
+  </div>
+
+  <!-- 排名查看界面 -->
+  <div id="adminPanel" class="tab-content hidden">
+    <h2>实时排名</h2>
+    <button class="refresh-btn" onclick="loadRankings()">刷新数据</button>
+    <table>
+      <thead id="tableHead"></thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+    <div id="adminMessage" class="message hidden"></div>
+  </div>
+
+  <script>
+    // ========== 1. 配置 Supabase 连接 ==========
+    const SUPABASE_URL = 'https://pxvnnhvrnhhmpcqscbwg.supabase.co'; // 替换！！
+    const SUPABASE_ANON_KEY = 'sb_publishable_Rvj_Px0ZAA1I8VPYGSItvw_7IVCP_jz'; // 替换！！
+    const supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+    // ========== 2. 常量 ==========
+    const JUDGES = Array.from({ length: 9 }, (_, i) => `评委${i + 1}`);
+    const CONTESTANTS = Array.from({ length: 23 }, (_, i) => `选手${i + 1}`);
+    const ITEM_COUNT = 17;
+
+    // ========== 3. 初始化界面 ==========
+    function init() {
+      // 填充评委下拉
+      const judgeSelect = document.getElementById('judgeSelect');
+      JUDGES.forEach(j => {
+        let opt = document.createElement('option');
+        opt.value = j;
+        opt.textContent = j;
+        judgeSelect.appendChild(opt);
+      });
+      // 填充选手下拉
+      const contestantSelect = document.getElementById('contestantSelect');
+      CONTESTANTS.forEach(c => {
+        let opt = document.createElement('option');
+        opt.value = c;
+        opt.textContent = c;
+        contestantSelect.appendChild(opt);
+      });
+      // 生成打分输入框
+      const grid = document.getElementById('scoreGrid');
+      for (let i = 1; i <= ITEM_COUNT; i++) {
+        grid.innerHTML += `<label>分项${i}</label><input type="number" id="item${i}" min="0" max="100" placeholder="0-100">`;
+      }
+
+      // 监听选择变化，检测同一评委是否已给该选手打过，并加载已有分数
+      document.getElementById('judgeSelect').addEventListener('change', checkExistingScore);
+      document.getElementById('contestantSelect').addEventListener('change', checkExistingScore);
+
+      // 生成排名表头
+      const headRow = document.getElementById('tableHead');
+      let headHTML = '<tr><th>选手</th>';
+      for (let i = 1; i <= ITEM_COUNT; i++) headHTML += `<th>分项${i}均分</th>`;
+      headHTML += '<th>17项总分合计</th><th>最终平均分</th><th>排名</th></tr>';
+      headRow.innerHTML = headHTML;
+
+      checkExistingScore();
+    }
+
+    // 检查当前评委-选手组合是否已有分数
+    async function checkExistingScore() {
+      const judge = document.getElementById('judgeSelect').value;
+      const contestant = document.getElementById('contestantSelect').value;
+      const btn = document.getElementById('submitBtn');
+      if (!judge || !contestant) {
+        btn.disabled = true;
+        return;
+      }
+      btn.disabled = false;
+
+      const { data, error } = await supabase
+        .from('scores')
+        .select('*')
+        .eq('judge_id', judge)
+        .eq('contestant', contestant)
+        .maybeSingle();
+
+      if (data) {
+        // 已有分数，填充表单
+        for (let i = 1; i <= ITEM_COUNT; i++) {
+          document.getElementById(`item${i}`).value = data[`item_${i}`] || '';
+        }
+        btn.textContent = '更新打分';
+      } else {
+        // 清空表单
+        for (let i = 1; i <= ITEM_COUNT; i++) {
+          document.getElementById(`item${i}`).value = '';
+        }
+        btn.textContent = '提交打分';
+      }
+    }
+
+    // 提交/更新分数
+    async function submitScore() {
+      const judge = document.getElementById('judgeSelect').value;
+      const contestant = document.getElementById('contestantSelect').value;
+      const messageDiv = document.getElementById('judgeMessage');
+      messageDiv.classList.add('hidden');
+
+      if (!judge || !contestant) {
+        showMessage('judgeMessage', '请选择评委和选手', 'error');
+        return;
+      }
+
+      // 收集分数
+      const scoreObj = { judge_id: judge, contestant };
+      for (let i = 1; i <= ITEM_COUNT; i++) {
+        const val = parseInt(document.getElementById(`item${i}`).value);
+        if (isNaN(val) || val < 0 || val > 100) {
+          showMessage('judgeMessage', `分项${i} 必须是 0-100 的整数`, 'error');
+          return;
+        }
+        scoreObj[`item_${i}`] = val;
+      }
+
+      // 使用 upsert 操作：有则更新，无则插入
+      const { error } = await supabase
+        .from('scores')
+        .upsert(scoreObj, { onConflict: 'judge_id, contestant' });
+
+      if (error) {
+        showMessage('judgeMessage', '提交失败: ' + error.message, 'error');
+      } else {
+        showMessage('judgeMessage', '提交成功！', 'success');
+        document.getElementById('submitBtn').textContent = '更新打分';
+      }
+    }
+
+    function showMessage(id, text, type) {
+      const div = document.getElementById(id);
+      div.textContent = text;
+      div.className = `message ${type}`;
+      div.classList.remove('hidden');
+    }
+
+    // ========== 4. 排名计算与显示 ==========
+    async function loadRankings() {
+      const { data, error } = await supabase
+        .from('scores')
+        .select('*')
+        .order('contestant');
+
+      if (error) {
+        showMessage('adminMessage', '加载失败: ' + error.message, 'error');
+        return;
+      }
+
+      // 按选手分组
+      const group = {};
+      CONTESTANTS.forEach(c => group[c] = []);
+      data.forEach(row => {
+        if (group[row.contestant]) group[row.contestant].push(row);
+      });
+
+      // 计算每个选手的各项均分（去极值）
+      const rankings = CONTESTANTS.map(contestant => {
+        const scores = group[contestant];
+        const itemAvgs = [];
+        for (let i = 1; i <= ITEM_COUNT; i++) {
+          const vals = scores.map(s => s[`item_${i}`]);
+          if (vals.length < 3) {
+            // 如果不足 3 个评委，无法去极值，这里直接算平均（或显示“—”）
+            itemAvgs.push(vals.length ? (vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(2) : '-');
+          } else {
+            // 去最高和最低
+            const sorted = [...vals].sort((a,b)=>a-b);
+            const trimmed = sorted.slice(1, -1);
+            const avg = trimmed.reduce((a,b)=>a+b,0) / trimmed.length;
+            itemAvgs.push(avg.toFixed(2));
+          }
+        }
+        // 总分合计
+        const sum = itemAvgs
+          .filter(v => v !== '-')
+          .reduce((sum, v) => sum + parseFloat(v), 0);
+        const finalAvg = (sum / ITEM_COUNT).toFixed(2);
+        return { contestant, itemAvgs, sum: sum.toFixed(2), finalAvg };
+      });
+
+      // 按最终平均分排序，并赋予排名
+      rankings.sort((a, b) => parseFloat(b.finalAvg) - parseFloat(a.finalAvg));
+      let rank = 1;
+      let prevScore = null;
+      rankings.forEach((r, idx) => {
+        if (idx > 0 && r.finalAvg !== prevScore) rank = idx + 1;
+        r.rank = rank;
+        prevScore = r.finalAvg;
+      });
+
+      // 输出表格
+      const tbody = document.getElementById('tableBody');
+      tbody.innerHTML = '';
+      rankings.forEach(r => {
+        let row = `<td>${r.contestant}</td>`;
+        r.itemAvgs.forEach(avg => row += `<td>${avg}</td>`);
+        row += `<td>${r.sum}</td><td>${r.finalAvg}</td><td>${r.rank}</td>`;
+        tbody.innerHTML += `<tr>${row}</tr>`;
+      });
+    }
+
+    // 切换标签页
+    function switchTab(tab) {
+      document.getElementById('judgePanel').classList.add('hidden');
+      document.getElementById('adminPanel').classList.add('hidden');
+      document.getElementById('judgeTab').classList.remove('active');
+      document.getElementById('adminTab').classList.remove('active');
+      if (tab === 'judge') {
+        document.getElementById('judgePanel').classList.remove('hidden');
+        document.getElementById('judgeTab').classList.add('active');
+      } else {
+        document.getElementById('adminPanel').classList.remove('hidden');
+        document.getElementById('adminTab').classList.add('active');
+        loadRankings();
+      }
+    }
+
+    // 页面加载完成
+    document.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>
